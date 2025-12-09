@@ -5,10 +5,10 @@ import (
 	"encoding/base64"
 	"fmt"
 	"path/filepath"
-	"github.com/gospider007/requests"
+
+	"github.com/go-resty/resty/v2"
 	"google.golang.org/protobuf/proto"
 
-	//"log/slog"
 	cdm "main/utils/runv3/cdm"
 	key "main/utils/runv3/key"
 	"os"
@@ -17,13 +17,13 @@ import (
 	"errors"
 	"io"
 
-	"github.com/Eyevinn/mp4ff/mp4"
+	"github.com/itouakirai/mp4ff/mp4"
 
-	//"io/ioutil"
 	"encoding/json"
 	"net/http"
 	"os/exec"
 	"strings"
+	"sync"
 
 	"github.com/grafov/m3u8"
 	"github.com/schollz/progressbar/v3"
@@ -36,24 +36,6 @@ type PlaybackLicense struct {
 	Status     int    `json:"status"`
 }
 
-//	func log() {
-//		f, err := os.OpenFile("log.txt", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
-//		if err != nil {
-//			slog.Error("error opening file: %s", err)
-//		}
-//		defer func(f *os.File) {
-//			err := f.Close()
-//			if err != nil {
-//				slog.Error("error closing file: %s", err)
-//			}
-//		}(f)
-//		opts := slog.HandlerOptions{
-//			AddSource: true,
-//			Level:     slog.LevelDebug,
-//		}
-//		logger := slog.New(slog.NewJSONHandler(os.Stdout, &opts))
-//		slog.SetDefault(logger)
-//	}
 func getPSSH(contentId string, kidBase64 string) (string, error) {
 	kidBytes, err := base64.StdEncoding.DecodeString(kidBase64)
 	if err != nil {
@@ -77,41 +59,50 @@ func getPSSH(contentId string, kidBase64 string) (string, error) {
 	pssh := base64.StdEncoding.EncodeToString(widevineCenc)
 	return pssh, nil
 }
-func BeforeRequest(cl *requests.Client, preCtx context.Context, method string, href string, options ...requests.RequestOption) (resp *requests.Response, err error) {
-	data := options[0].Data
+
+func BeforeRequest(cl *resty.Client, ctx context.Context, url string, body []byte) (*resty.Response, error) {
 	jsondata := map[string]interface{}{
-		"challenge":      base64.StdEncoding.EncodeToString(data.([]byte)),
+		"challenge":      base64.StdEncoding.EncodeToString(body), // 'body' is passed in directly
 		"key-system":     "com.widevine.alpha",
-		"uri":            "data:;base64," + preCtx.Value("pssh").(string),
-		"adamId":         preCtx.Value("adamId").(string),
+		"uri":            ctx.Value("uriPrefix").(string) + "," + ctx.Value("pssh").(string),
+		"adamId":         ctx.Value("adamId").(string),
 		"isLibrary":      false,
 		"user-initiated": true,
 	}
-	options[0].Data = nil
-	options[0].Json = jsondata
-	resp, err = cl.Request(preCtx, method, href, options...)
+
+	resp, err := cl.R().
+		SetContext(ctx).
+		SetBody(jsondata).
+		Post(url)
+
 	if err != nil {
 		fmt.Println(err)
 	}
 
-	return
+	return resp, err
 }
-func AfterRequest(Response *requests.Response) ([]byte, error) {
-	var ResponseData PlaybackLicense
-	_, err := Response.Json(&ResponseData)
+
+func AfterRequest(response *resty.Response) ([]byte, error) {
+	var responseData PlaybackLicense
+
+	err := json.Unmarshal(response.Body(), &responseData)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse response: %v", err)
+		return nil, fmt.Errorf("failed to parse response JSON: %v", err)
 	}
-	if ResponseData.ErrorCode != 0 || ResponseData.Status != 0 {
-		return nil, fmt.Errorf("error code: %d", ResponseData.ErrorCode)
+
+	if responseData.ErrorCode != 0 || responseData.Status != 0 {
+		return nil, fmt.Errorf("error in license response, code: %d, status: %d", responseData.ErrorCode, responseData.Status)
 	}
-	License, err := base64.StdEncoding.DecodeString(ResponseData.License)
+
+	license, err := base64.StdEncoding.DecodeString(responseData.License)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode license: %v", err)
 	}
-	return License, nil
+
+	return license, nil
 }
-func GetWebplayback(adamId string, authtoken string, mutoken string, mvmode bool) (string, string, error) {
+
+func GetWebplayback(adamId string, authtoken string, mutoken string, mvmode bool) (string, string, string, error) {
 	url := "https://play.music.apple.com/WebObjects/MZPlay.woa/wa/webPlayback"
 	postData := map[string]string{
 		"salableAdamId": adamId,
@@ -119,12 +110,12 @@ func GetWebplayback(adamId string, authtoken string, mutoken string, mvmode bool
 	jsonData, err := json.Marshal(postData)
 	if err != nil {
 		fmt.Println("Error encoding JSON:", err)
-		return "", "", err
+		return "", "", "", err
 	}
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer([]byte(jsonData)))
 	if err != nil {
 		fmt.Println("Error creating request:", err)
-		return "", "", err
+		return "", "", "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Origin", "https://music.apple.com")
@@ -139,7 +130,7 @@ func GetWebplayback(adamId string, authtoken string, mutoken string, mvmode bool
 	//resp, err := client.Do(req)
 	if err != nil {
 		fmt.Println("Error sending request:", err)
-		return "", "", err
+		return "", "", "", err
 	}
 	defer resp.Body.Close()
 	//fmt.Println("Response Status:", resp.Status)
@@ -147,25 +138,25 @@ func GetWebplayback(adamId string, authtoken string, mutoken string, mvmode bool
 	err = json.NewDecoder(resp.Body).Decode(&obj)
 	if err != nil {
 		fmt.Println("json err:", err)
-		return "", "", err
+		return "", "", "", err
 	}
 	if len(obj.List) > 0 {
 		if mvmode {
-			return obj.List[0].HlsPlaylistUrl, "", nil
+			return obj.List[0].HlsPlaylistUrl, "", "", nil
 		}
 		// 遍历 Assets
-		for i, _ := range obj.List[0].Assets {
+		for i := range obj.List[0].Assets {
 			if obj.List[0].Assets[i].Flavor == "28:ctrp256" {
-				kidBase64, fileurl, err := extractKidBase64(obj.List[0].Assets[i].URL, false)
+				kidBase64, fileurl, uriPrefix, err := extractKidBase64(obj.List[0].Assets[i].URL, false)
 				if err != nil {
-					return "", "", err
+					return "", "", "", err
 				}
-				return fileurl, kidBase64, nil
+				return fileurl, kidBase64, uriPrefix, nil
 			}
 			continue
 		}
 	}
-	return "", "", nil
+	return "", "", "", errors.New("Unavailable")
 }
 
 type Songlist struct {
@@ -180,30 +171,32 @@ type Songlist struct {
 	Status int `json:"status"`
 }
 
-func extractKidBase64(b string, mvmode bool) (string, string, error) {
+func extractKidBase64(b string, mvmode bool) (string, string, string, error) {
 	resp, err := http.Get(b)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", "", errors.New(resp.Status)
+		return "", "", "", errors.New(resp.Status)
 	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	masterString := string(body)
 	from, listType, err := m3u8.DecodeFrom(strings.NewReader(masterString), true)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	var kidbase64 string
+	var uriPrefix string
 	var urlBuilder strings.Builder
 	if listType == m3u8.MEDIA {
 		mediaPlaylist := from.(*m3u8.MediaPlaylist)
 		if mediaPlaylist.Key != nil {
 			split := strings.Split(mediaPlaylist.Key.URI, ",")
+			uriPrefix = split[0]
 			kidbase64 = split[1]
 			lastSlashIndex := strings.LastIndex(b, "/")
 			// 截取最后一个斜杠之前的部分
@@ -230,7 +223,7 @@ func extractKidBase64(b string, mvmode bool) (string, string, error) {
 	} else {
 		fmt.Println("Not a media playlist")
 	}
-	return kidbase64, urlBuilder.String(), nil
+	return kidbase64, urlBuilder.String(), uriPrefix, nil
 }
 func extsong(b string) bytes.Buffer {
 	resp, err := http.Get(b)
@@ -260,18 +253,19 @@ func extsong(b string) bytes.Buffer {
 	io.Copy(io.MultiWriter(&buffer, bar), resp.Body)
 	return buffer
 }
-func Run(adamId string, trackpath string, authtoken string, mutoken string, mvmode bool) (string, error) {
+func Run(adamId string, trackpath string, authtoken string, mutoken string, mvmode bool, serverUrl string) (string, error) {
 	var keystr string //for mv key
 	var fileurl string
 	var kidBase64 string
+	var uriPrefix string
 	var err error
 	if mvmode {
-		kidBase64, fileurl, err = extractKidBase64(trackpath, true)
+		kidBase64, fileurl, uriPrefix, err = extractKidBase64(trackpath, true)
 		if err != nil {
 			return "", err
 		}
 	} else {
-		fileurl, kidBase64, err = GetWebplayback(adamId, authtoken, mutoken, false)
+		fileurl, kidBase64, uriPrefix, err = GetWebplayback(adamId, authtoken, mutoken, false)
 		if err != nil {
 			return "", err
 		}
@@ -279,29 +273,38 @@ func Run(adamId string, trackpath string, authtoken string, mutoken string, mvmo
 	ctx := context.Background()
 	ctx = context.WithValue(ctx, "pssh", kidBase64)
 	ctx = context.WithValue(ctx, "adamId", adamId)
+	ctx = context.WithValue(ctx, "uriPrefix", uriPrefix)
 	pssh, err := getPSSH("", kidBase64)
 	//fmt.Println(pssh)
 	if err != nil {
 		fmt.Println(err)
 		return "", err
 	}
-	headers := map[string]interface{}{
+	headers := map[string]string{
 		"authorization":            "Bearer " + authtoken,
 		"x-apple-music-user-token": mutoken,
 	}
-	client, _ := requests.NewClient(nil, requests.ClientOption{
-		Headers: headers,
-	})
+	client := resty.New()
+	client.SetHeaders(headers)
 	key := key.Key{
 		ReqCli:        client,
 		BeforeRequest: BeforeRequest,
 		AfterRequest:  AfterRequest,
 	}
 	key.CdmInit()
-	keystr, keybt, err := key.GetKey(ctx, "https://play.itunes.apple.com/WebObjects/MZPlay.woa/wa/acquireWebPlaybackLicense", pssh, nil)
-	if err != nil {
-		fmt.Println(err)
-		return "", err
+	var keybt []byte
+	if serverUrl != "" {
+		keystr, keybt, err = key.GetKey(ctx, serverUrl, pssh, nil)
+		if err != nil {
+			fmt.Println(err)
+			return "", err
+		}
+	} else {
+		keystr, keybt, err = key.GetKey(ctx, "https://play.itunes.apple.com/WebObjects/MZPlay.woa/wa/acquireWebPlaybackLicense", pssh, nil)
+		if err != nil {
+			fmt.Println(err)
+			return "", err
+		}
 	}
 	if mvmode {
 		keyAndUrls := "1:" + keystr + ";" + fileurl
@@ -335,6 +338,95 @@ func Run(adamId string, trackpath string, authtoken string, mutoken string, mvmo
 	return "", nil
 }
 
+// Segment 结构体用于在 Channel 中传递分段数据
+type Segment struct {
+	Index int
+	Data  []byte
+}
+
+func downloadSegment(url string, index int, wg *sync.WaitGroup, segmentsChan chan<- Segment, client *http.Client, limiter chan struct{}) {
+	// 函数退出时，从 limiter 中接收一个值，释放一个并发槽位
+	defer func() {
+		<-limiter
+		wg.Done()
+	}()
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		fmt.Printf("错误(分段 %d): 创建请求失败: %v\n", index, err)
+		return
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Printf("错误(分段 %d): 下载失败: %v\n", index, err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		fmt.Printf("错误(分段 %d): 服务器返回状态码 %d\n", index, resp.StatusCode)
+		return
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		fmt.Printf("错误(分段 %d): 读取数据失败: %v\n", index, err)
+		return
+	}
+
+	// 将下载好的分段（包含序号和数据）发送到 Channel
+	segmentsChan <- Segment{Index: index, Data: data}
+}
+
+// fileWriter 从 Channel 接收分段并按顺序写入文件
+func fileWriter(wg *sync.WaitGroup, segmentsChan <-chan Segment, outputFile io.Writer, totalSegments int) {
+	defer wg.Done()
+
+	// 缓冲区，用于存放乱序到达的分段
+	// key 是分段序号，value 是分段数据
+	segmentBuffer := make(map[int][]byte)
+	nextIndex := 0 // 期望写入的下一个分段的序号
+
+	for segment := range segmentsChan {
+		// 检查收到的分段是否是当前期望的
+		if segment.Index == nextIndex {
+			//fmt.Printf("写入分段 %d\n", segment.Index)
+			_, err := outputFile.Write(segment.Data)
+			if err != nil {
+				fmt.Printf("错误(分段 %d): 写入文件失败: %v\n", segment.Index, err)
+			}
+			nextIndex++
+
+			// 检查缓冲区中是否有下一个连续的分段
+			for {
+				data, ok := segmentBuffer[nextIndex]
+				if !ok {
+					break // 缓冲区里没有下一个，跳出循环，等待下一个分段到达
+				}
+
+				//fmt.Printf("从缓冲区写入分段 %d\n", nextIndex)
+				_, err := outputFile.Write(data)
+				if err != nil {
+					fmt.Printf("错误(分段 %d): 从缓冲区写入文件失败: %v\n", nextIndex, err)
+				}
+				// 从缓冲区删除已写入的分段，释放内存
+				delete(segmentBuffer, nextIndex)
+				nextIndex++
+			}
+		} else {
+			// 如果不是期望的分段，先存入缓冲区
+			//fmt.Printf("缓冲分段 %d (等待 %d)\n", segment.Index, nextIndex)
+			segmentBuffer[segment.Index] = segment.Data
+		}
+	}
+
+	// 确保所有分段都已写入
+	if nextIndex != totalSegments {
+		fmt.Printf("警告: 写入完成，但似乎有分段丢失。期望 %d 个, 实际写入 %d 个。\n", totalSegments, nextIndex)
+	}
+}
+
 func ExtMvData(keyAndUrls string, savePath string) error {
 	segments := strings.Split(keyAndUrls, ";")
 	key := segments[0]
@@ -345,36 +437,51 @@ func ExtMvData(keyAndUrls string, savePath string) error {
 		fmt.Printf("创建文件失败：%v\n", err)
 		return err
 	}
-	defer tempFile.Close()
 	defer os.Remove(tempFile.Name())
+	defer tempFile.Close()
 
-	// 依次下载每个链接并写入文件
-	bar := progressbar.DefaultBytes(
-		-1,
-		"Downloading...",
-	)
+	var downloadWg, writerWg sync.WaitGroup
+	segmentsChan := make(chan Segment, len(urls))
+	// --- 新增代码: 定义最大并发数 ---
+	const maxConcurrency = 10
+	// --- 新增代码: 创建带缓冲的 Channel 作为信号量 ---
+	limiter := make(chan struct{}, maxConcurrency)
+	client := &http.Client{}
+
+	// 初始化进度条
+	bar := progressbar.DefaultBytes(-1, "Downloading...")
 	barWriter := io.MultiWriter(tempFile, bar)
-	for _, url := range urls {
-		resp, err := http.Get(url)
-		if err != nil {
-			fmt.Printf("下载链接 %s 失败：%v\n", url, err)
-			return err
-		}
-		if resp.StatusCode != http.StatusOK {
-			fmt.Printf("链接 %s 响应失败：%v\n", url, resp.Status)
-			return errors.New(resp.Status)
-		}
-		// 将响应体写入输出文件
-		_, err = io.Copy(barWriter, resp.Body)
-		defer resp.Body.Close() // 注意及时关闭响应体，避免资源泄露
-		if err != nil {
-			fmt.Printf("写入文件失败：%v\n", err)
-			return err
-		}
 
-		//fmt.Printf("第 %d 个链接 %s 下载并写入完成\n", idx+1, url)
+	// 启动写入 Goroutine
+	writerWg.Add(1)
+	go fileWriter(&writerWg, segmentsChan, barWriter, len(urls))
+
+	// 启动下载 Goroutines
+	for i, url := range urls {
+		// 在启动 Goroutine 前，向 limiter 发送一个值来“获取”一个槽位
+		// 如果 limiter 已满 (达到10个)，这里会阻塞，直到有其他任务完成并释放槽位
+		//fmt.Printf("请求启动任务 %d...\n", i)
+		limiter <- struct{}{}
+		//fmt.Printf("...任务 %d 已启动\n", i)
+
+		downloadWg.Add(1)
+		// 将 limiter 传递给下载函数
+		go downloadSegment(url, i, &downloadWg, segmentsChan, client, limiter)
 	}
-	tempFile.Close()
+
+	// 等待所有下载任务完成
+	downloadWg.Wait()
+	// 下载完成后，关闭 Channel。写入 Goroutine 会在处理完 Channel 中所有数据后退出。
+	close(segmentsChan)
+
+	// 等待写入 Goroutine 完成所有写入和缓冲处理
+	writerWg.Wait()
+
+	// 显式关闭文件（defer会再次调用，但重复关闭是安全的）
+	if err := tempFile.Close(); err != nil {
+		fmt.Printf("关闭临时文件失败: %v\n", err)
+		return err
+	}
 	fmt.Println("\nDownloaded.")
 
 	cmd1 := exec.Command("mp4decrypt", "--key", key, tempFile.Name(), filepath.Base(savePath))
